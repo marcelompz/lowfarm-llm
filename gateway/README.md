@@ -14,9 +14,10 @@ This README covers how to run and extend the code.
 ## Quick start
 
 ```sh
-cp .env.example .env && chmod 600 .env   # fill in the two API keys
 cd ..
-docker compose up -d --build
+make secrets     # generates secrets/lowfarm.env with 256-bit random values
+make check       # validates strength, permissions and scans git for leaks
+make up          # brings the stack up with three mock workers
 ```
 
 The stack comes up with three mock workers that **self-register** with the
@@ -40,6 +41,30 @@ curl -N localhost:8000/v1/chat/completions \
   -d '{"model":"qwen2.5-0.5b-instruct-q4_k_m",
        "messages":[{"role":"user","content":"hello farm"}],"stream":true}'
 ```
+
+### Secrets
+
+The keys live in `secrets/lowfarm.env` (gitignored, mode `0600`) and are
+never printed — the tooling shows SHA-256 prefixes instead. The full policy
+is in [`../docs/SECRETS.md`](../docs/SECRETS.md).
+
+```sh
+make secrets                          # generate
+python scripts/generate_secrets.py --rotate gateway_api_key   # rotate one
+make check                            # validate + scan for leaks
+```
+
+Two rotation mechanisms exist:
+
+* **Rotation window** — `GATEWAY_API_KEY` and `ADMIN_API_KEY` accept a
+  comma-separated list, so the old and the new key are valid at the same
+  time and traffic never drops.
+* **Revocation** — replacing the bootstrap key deletes the previous
+  default client record, so the old key stops working immediately.
+
+The gateway also reads keys from a mounted file (`GATEWAY_API_KEY_FILE`),
+which is the shape to use with Docker secrets in production. With
+`REQUIRE_STRONG_KEYS=true` it refuses to boot on a placeholder key.
 
 ---
 
@@ -240,6 +265,10 @@ with defaults. The ones that matter most:
 | `MAX_RETRIES` | `2` | Upstream retries before the first token |
 | `THERMAL_SOFT_LIMIT_C` | `45` | Demotion threshold |
 | `THERMAL_HARD_LIMIT_C` | `52` | Drain threshold |
+| `REQUIRE_STRONG_KEYS` | `false` | Refuse to start with a placeholder key |
+| `MIN_KEY_LENGTH` | `24` | Minimum accepted key length |
+| `GATEWAY_API_KEY_FILE` | — | Read the key from a mounted file instead |
+| `ADMIN_API_KEY_FILE` | — | Read the key from a mounted file instead |
 | `CHAT_HISTORY_ENABLED` | `true` | Server-side conversation history |
 | `CHAT_HISTORY_MAX_MESSAGES` | `40` | History window (oldest turns dropped) |
 | `CHAT_HISTORY_TTL` | `86400` | History lifetime in Redis (s) |

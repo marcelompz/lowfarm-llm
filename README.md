@@ -132,9 +132,12 @@ development workflow.
 ### Try it
 
 ```sh
-cp .env.example .env && chmod 600 .env   # set the two API keys
-docker compose up -d --build
+make secrets     # generates secrets/lowfarm.env with 256-bit random values
+make check       # validates strength, permissions and scans git for leaks
+make up          # starts the stack using that file
+```
 
+```sh
 curl -s localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
@@ -160,7 +163,17 @@ risk assessment, and configuration templates — lives in
 | Document | Contents |
 |---|---|
 | [`docs/MasterProjectPlan.md`](docs/MasterProjectPlan.md) | The complete technical plan: architecture, scheduling, failure handling, metrics, security, energy strategy, templates, risks |
+| [`docs/SECRETS.md`](docs/SECRETS.md) | Secret policy: classification, generation, rotation, revocation, incident response |
 | [`gateway/README.md`](gateway/README.md) | Gateway API surface, worker protocol, configuration, development workflow |
+
+## Security
+
+Secrets live in `secrets/lowfarm.env` (gitignored, mode `0600`) and are
+generated with the OS CSPRNG. `make check` validates their strength and
+scans both the git index and the entire history for leaks. The gateway
+refuses to start with a placeholder key, accepts several keys at once so a
+rotation never drops traffic, and revokes the previous bootstrap key when
+it changes.
 
 ## Contributing
 

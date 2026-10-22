@@ -1029,6 +1029,20 @@ Point Open WebUI's OpenAI connection at `http://<gateway>:8000/v1` with the bear
 | 36 | Quota admission reserves an estimated token cost and reconciles it with the real usage on completion | §6\.2 |
 | 37 | Test suite grew from 45 to 81 cases | §8 Phase 1 |
 
+### Revision 6 (2026\-10\-22) — Secret policy
+
+| # | Change | Section |
+|---|---|---|
+| 38 | Secret policy documented: classification, generation, storage, rotation, revocation, incident response | `docs/SECRETS.md` |
+| 39 | `secrets/lowfarm.env` (gitignored, mode 0600) with a generator that prints only SHA-256 fingerprints | `scripts/generate_secrets.py` |
+| 40 | Leak scanner checks the git index **and the whole history** for secret values | `scripts/check_secrets.py` |
+| 41 | Rotation window: `GATEWAY_API_KEY` and `ADMIN_API_KEY` accept a comma-separated list, so the old and new key are valid at once | §6\.1 |
+| 42 | Rotating the bootstrap key revokes the previous one — the default client record is deleted, and only one client may be named `default` | §6\.2 |
+| 43 | The gateway audits its own keys at boot and refuses to start on a placeholder when `REQUIRE_STRONG_KEYS=true` | §6\.1 |
+| 44 | Keys can be read from a mounted file (`*_API_KEY_FILE`), the shape to use with Docker secrets in production | §6\.1 |
+| 45 | `Makefile` as the single entry point: `make secrets / check / up / obs / test / lint` | — |
+| 46 | Test suite grew from 81 to 104 cases | §8 Phase 1 |
+
 ### Revision 2 (2026\-10\-21)
 
 | # | Change | Section |

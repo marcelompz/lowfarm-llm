@@ -45,6 +45,53 @@ def _matches(provided: str, expected: str) -> bool:
     return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _matches_any(provided: str, expected_list: list[str]) -> bool:
+    """Constant-time match against a list of valid keys (rotation window)."""
+    ok = False
+    for candidate in expected_list:
+        # Do not short-circuit: every candidate must be compared.
+        ok |= _matches(provided, candidate)
+    return ok
+
+
+# Substrings that indicate a placeholder was never replaced.
+_PLACEHOLDER_MARKERS = (
+    "change-me",
+    "changeme",
+    "example",
+    "your-",
+    "placeholder",
+    "admin",
+    "password",
+    "secret123",
+    "test-",
+)
+
+
+def audit_keys(keys: dict[str, list[str]], min_length: int) -> list[str]:
+    """Report weak or placeholder keys.
+
+    Used at startup so an operator finds out *before* the farm is exposed,
+    not after a scanner does.
+    """
+    problems: list[str] = []
+    for name, values in keys.items():
+        for index, value in enumerate(values):
+            label = name if len(values) == 1 else f"{name}[{index}]"
+            if len(value) < min_length:
+                problems.append(
+                    f"{label} is only {len(value)} characters "
+                    f"(minimum {min_length})"
+                )
+                continue
+            lowered = value.lower()
+            for marker in _PLACEHOLDER_MARKERS:
+                if marker in lowered:
+                    problems.append(f"{label} contains the placeholder marker {marker!r}")
+                    break
+    return problems
+
+
 async def require_client(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
@@ -63,6 +110,6 @@ async def require_admin_key(
     settings: Settings = Depends(get_settings),
 ) -> str:
     token = _extract(credentials)
-    if not _matches(token, settings.admin_api_key):
+    if not _matches_any(token, settings.admin_api_keys):
         raise _unauthorized("Invalid admin key")
     return token

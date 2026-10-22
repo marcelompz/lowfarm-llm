@@ -7,9 +7,10 @@ rebuild.  Names map 1:1 to the `docker-compose.yml` environment block.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,8 +24,18 @@ class Settings(BaseSettings):
 
     # ---- Core -----------------------------------------------------------
     redis_url: str = "redis://redis:6379/0"
-    gateway_api_key: str = Field(..., min_length=8)
-    admin_api_key: str = Field(..., min_length=8)
+    # Comma-separated: several keys stay valid at once, which is what makes
+    # a rotation window possible without dropping traffic.
+    gateway_api_key: str = ""
+    admin_api_key: str = ""
+    # Docker-style secret mounts: when set, the value is read from the file
+    # and the plain variable is ignored.
+    gateway_api_key_file: str | None = None
+    admin_api_key_file: str | None = None
+
+    # ---- Secret hygiene -------------------------------------------------
+    require_strong_keys: bool = False
+    min_key_length: int = Field(default=24, ge=8)
 
     # ---- Bootstrap ------------------------------------------------------
     # Comma-separated entries; fields within an entry separated by "|".
@@ -71,6 +82,50 @@ class Settings(BaseSettings):
     quota_token_estimate_ratio: int = Field(default=4, ge=1)
 
     # ---- Derived --------------------------------------------------------
+
+    @model_validator(mode="after")
+    def _load_key_files(self) -> "Settings":
+        """Read keys from a mounted secret file when one is configured.
+
+        Production deployments use Docker secrets (see docs/SECRETS.md §7);
+        the value then never appears in `docker inspect` output.
+        """
+        for field_name, file_field in (
+            ("gateway_api_key", "gateway_api_key_file"),
+            ("admin_api_key", "admin_api_key_file"),
+        ):
+            path = getattr(self, file_field)
+            if not path:
+                continue
+            try:
+                content = Path(path).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot read {file_field}={path!r}: {exc}"
+                ) from exc
+            if not content:
+                raise ValueError(f"{file_field}={path!r} is empty")
+            object.__setattr__(self, field_name, content)
+
+        if not self.gateway_api_key:
+            raise ValueError(
+                "GATEWAY_API_KEY is required (or point GATEWAY_API_KEY_FILE at a file)"
+            )
+        if not self.admin_api_key:
+            raise ValueError(
+                "ADMIN_API_KEY is required (or point ADMIN_API_KEY_FILE at a file)"
+            )
+        return self
+
+    @property
+    def gateway_api_keys(self) -> list[str]:
+        """Every key accepted on the public plane."""
+        return [k.strip() for k in self.gateway_api_key.split(",") if k.strip()]
+
+    @property
+    def admin_api_keys(self) -> list[str]:
+        """Every key accepted on the admin plane."""
+        return [k.strip() for k in self.admin_api_key.split(",") if k.strip()]
 
     @property
     def seed_entries(self) -> list[dict[str, str]]:

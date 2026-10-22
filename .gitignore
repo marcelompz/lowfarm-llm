@@ -24,6 +24,11 @@ htmlcov/
 *.pem
 *.key
 
+# Secrets directory: the real values never enter git, only the template.
+secrets/*
+!secrets/*.example
+!secrets/README.md
+
 # Runtime data
 *.log
 data/

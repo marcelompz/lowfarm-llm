@@ -1,5 +1,12 @@
 name: lowfarm
 
+# Every secret comes from secrets/lowfarm.env (gitignored).  Use:
+#   make up      (which passes --env-file secrets/lowfarm.env)
+# or:
+#   docker compose --env-file secrets/lowfarm.env up -d
+# Without that file the required-variable checks below fail loudly rather
+# than starting the gateway with a default key.
+
 services:
   gateway:
     build: ./gateway
@@ -8,8 +15,10 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - GATEWAY_API_KEY=${GATEWAY_API_KEY:?set GATEWAY_API_KEY in .env}
-      - ADMIN_API_KEY=${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:?set GATEWAY_API_KEY in secrets/lowfarm.env}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?set ADMIN_API_KEY in secrets/lowfarm.env}
+      # Refuse to boot with a placeholder key in a deployed environment.
+      - REQUIRE_STRONG_KEYS=${REQUIRE_STRONG_KEYS:-true}
       # Bootstrap only; dynamic registration is the primary path (§3.1).
       - WORKER_SEEDS=${WORKER_SEEDS:-}
       - SCHEDULING_POLICY=${SCHEDULING_POLICY:-least_outstanding}
@@ -192,7 +201,7 @@ services:
     profiles: [observability]
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in secrets/lowfarm.env}
       # Dashboards and the Prometheus datasource are provisioned from disk.
       - GF_INSTALL_PLUGINS=
     volumes:

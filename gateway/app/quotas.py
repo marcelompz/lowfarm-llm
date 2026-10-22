@@ -40,6 +40,10 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
+# Store pointer to the hash of the current bootstrap key.
+_DEFAULT_CLIENT_META = "default_client"
+
+
 @dataclass
 class ClientIdentity:
     key_hash: str
@@ -104,9 +108,13 @@ class QuotaManager:
                 max_concurrency=int(record.get("max_concurrency", 1)),
             )
 
-        # The bootstrap key always works, with the default limits.
-        if secrets.compare_digest(
-            api_key.encode("utf-8"), self._settings.gateway_api_key.encode("utf-8")
+        # The bootstrap key(s) always work, with the default limits.
+        # Several may be valid at once so a rotation does not drop traffic.
+        if any(
+            secrets.compare_digest(
+                api_key.encode("utf-8"), candidate.encode("utf-8")
+            )
+            for candidate in self._settings.gateway_api_keys
         ):
             return ClientIdentity(
                 key_hash=key_hash,
@@ -119,22 +127,48 @@ class QuotaManager:
         return None
 
     async def ensure_default_client(self) -> None:
-        """Create the default client record so it is visible and tunable."""
+        """Create the default client record so it is visible and tunable.
+
+        The record of the *previous* bootstrap key is removed.  Without
+        this, rotating ``GATEWAY_API_KEY`` would leave the old key working
+        forever, because the default client record lives in Redis and
+        survives the restart.
+        """
         key_hash = hash_key(self._settings.gateway_api_key)
+        previous = await self._store.get_meta(_DEFAULT_CLIENT_META)
+
+        if previous and previous != key_hash:
+            # The bootstrap key changed: revoke the old one.
+            await self._store.delete_client(previous)
+            await self._store.reset_counter(
+                QUOTA_INFLIGHT_KEY.format(key_hash=previous)
+            )
+
         existing = await self._store.load_client(key_hash)
-        if existing is not None:
-            return
-        await self._store.save_client(
-            key_hash,
-            {
-                "name": "default",
-                "rpm_limit": self._settings.default_rpm_limit,
-                "tpm_limit": self._settings.default_tpm_limit,
-                "max_concurrency": self._settings.default_max_concurrency,
-                "enabled": 1,
-                "created_at": time.time(),
-            },
-        )
+        if existing is None:
+            await self._store.save_client(
+                key_hash,
+                {
+                    "name": "default",
+                    "rpm_limit": self._settings.default_rpm_limit,
+                    "tpm_limit": self._settings.default_tpm_limit,
+                    "max_concurrency": self._settings.default_max_concurrency,
+                    "enabled": 1,
+                    "created_at": time.time(),
+                },
+            )
+        await self._store.set_meta(_DEFAULT_CLIENT_META, key_hash)
+
+        # Invariant: exactly one client is named "default", and it is the
+        # current bootstrap key.  Anything else with that name is a leftover
+        # from an earlier rotation and would keep a revoked key alive.
+        for record in await self._store.load_all_clients():
+            other_hash = str(record.get("key_hash", ""))
+            if other_hash and other_hash != key_hash and record.get("name") == "default":
+                await self._store.delete_client(other_hash)
+                await self._store.reset_counter(
+                    QUOTA_INFLIGHT_KEY.format(key_hash=other_hash)
+                )
 
     # -- client management ------------------------------------------------
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -46,10 +47,12 @@ from .scheduler import (
     NoWorkerAvailable,
     Scheduler,
 )
-from .security import require_admin_key, require_client
+from .security import audit_keys, require_admin_key, require_client
 from .store import RedisStore, Store
 
 API_VERSION = "v1"
+
+logger = logging.getLogger("lowfarm.gateway")
 
 
 def create_app(
@@ -99,6 +102,8 @@ def create_app(
         app.state.client = http_client
         app.state.quota_manager = quota_manager
         app.state.chat_history = chat_history
+
+        _audit_secrets(settings)
 
         await quota_manager.ensure_default_client()
         await _seed_workers(registry, settings)
@@ -469,6 +474,36 @@ async def _dispatch_text(
         status_code=last_error.status_code if last_error else 502,
         detail=str(last_error) if last_error else "no upstream available",
     )
+
+
+# ----------------------------------------------------------------------
+# Startup checks
+# ----------------------------------------------------------------------
+
+
+def _audit_secrets(settings: Settings) -> None:
+    """Refuse to start with placeholder keys, if configured to.
+
+    A weak key is a public API key, so it is worth catching at boot rather
+    than after a scanner does.  The values are never logged — only the
+    name of the offending variable.
+    """
+    problems = audit_keys(
+        {
+            "GATEWAY_API_KEY": settings.gateway_api_keys,
+            "ADMIN_API_KEY": settings.admin_api_keys,
+        },
+        settings.min_key_length,
+    )
+    if not problems:
+        return
+    message = "weak secret(s): " + "; ".join(problems)
+    if settings.require_strong_keys:
+        raise RuntimeError(
+            f"{message}. Run `make secrets` and set the values in "
+            f"secrets/lowfarm.env, or set REQUIRE_STRONG_KEYS=false for local work."
+        )
+    logger.warning("%s", message)
 
 
 # ----------------------------------------------------------------------

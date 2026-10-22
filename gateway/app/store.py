@@ -33,6 +33,7 @@ AFFINITY_KEY = "session:{conversation_id}"
 CHAT_KEY = "chat:{conversation_id}"
 CLIENT_KEY = "client:{key_hash}"
 CLIENT_INDEX = "clients:index"
+META_KEY = "meta:{name}"
 QUOTA_RPM_KEY = "quota:rpm:{key_hash}:{window}"
 QUOTA_TPM_KEY = "quota:tpm:{key_hash}:{window}"
 QUOTA_INFLIGHT_KEY = "quota:inflight:{key_hash}"
@@ -74,6 +75,8 @@ class Store(Protocol):
     async def load_client(self, key_hash: str) -> dict[str, Any] | None: ...
     async def load_all_clients(self) -> list[dict[str, Any]]: ...
     async def delete_client(self, key_hash: str) -> None: ...
+    async def get_meta(self, name: str) -> str | None: ...
+    async def set_meta(self, name: str, value: str) -> None: ...
     async def incr_counter(
         self, key: str, delta: int, ttl: int, window: int | None = None
     ) -> int: ...
@@ -388,6 +391,13 @@ class RedisStore:
         pipe.srem(CLIENT_INDEX, key_hash)
         await pipe.execute()
 
+    async def get_meta(self, name: str) -> str | None:
+        value = await self._redis.get(META_KEY.format(name=name))
+        return value if value else None
+
+    async def set_meta(self, name: str, value: str) -> None:
+        await self._redis.set(META_KEY.format(name=name), value)
+
     async def incr_counter(
         self, key: str, delta: int, ttl: int, window: int | None = None
     ) -> int:
@@ -426,6 +436,7 @@ class MemoryStore:
         self._chats: dict[str, list[dict[str, Any]]] = {}
         self._chat_expiry: dict[str, float] = {}
         self._clients: dict[str, dict[str, Any]] = {}
+        self._meta: dict[str, str] = {}
         self._counters: dict[str, int] = {}
         self._counter_expiry: dict[str, float] = {}
         self._worker_ttl = worker_ttl
@@ -568,6 +579,14 @@ class MemoryStore:
     async def delete_client(self, key_hash: str) -> None:
         async with self._lock:
             self._clients.pop(key_hash, None)
+
+    async def get_meta(self, name: str) -> str | None:
+        async with self._lock:
+            return self._meta.get(name)
+
+    async def set_meta(self, name: str, value: str) -> None:
+        async with self._lock:
+            self._meta[name] = value
 
     async def incr_counter(
         self, key: str, delta: int, ttl: int, window: int | None = None
