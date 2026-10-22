@@ -551,11 +551,12 @@ working but incomplete; see the "Known limitations" section of `gateway/README.m
 - [x] Create **mock workers** (simulated endpoints using python or local llama.cpp) to test load balancing and failure injection.  
 - [x] Implement Server-Sent Events (SSE) streaming pass-through.  
 - [x] Implement Prometheus metrics endpoint (§5\.1).  
-- [◐] Grafana dashboard — the Prometheus/Grafana services are wired (`ops/prometheus.yml`) but no dashboard JSON is committed yet.  
+- [x] Grafana dashboard — provisioned automatically from `ops/grafana/`, 14 panels.  
 - [x] Write the integration test suite: failover, mid-stream drop, worker reboot, Redis restart, auth rejection.  
-- [◐] Redis-backed chat history (§3\.1) — not implemented; the client resends the full history, which keeps affinity safe.  
-- [◐] Per-client quotas (§6\.2) — the data model is specified but the middleware is not written.  
-- [ ] **Exit criterion:** a mock fleet of N workers behind the gateway, load-balanced, with fault injection passing. ◐ *Failover, circuit breaking, TTL eviction and re-registration verified manually against the live stack; the automated suite covers the same paths in-process.*
+- [x] Redis-backed chat history (§3\.1) — server-authoritative transcript, three client shapes accepted.  
+- [x] Per-client quotas (§6\.2) — RPM, TPM and concurrency, admin-managed keys.  
+- [x] True `/v1/completions` text-completion path.  
+- [x] **Exit criterion:** a mock fleet of N workers behind the gateway, load-balanced, with fault injection passing.
 
 ### Phase 2: Mobile Worker Provisioning (Samsung A30 & Legacy Devices)
 
@@ -1015,6 +1016,18 @@ Point Open WebUI's OpenAI connection at `http://<gateway>:8000/v1` with the bear
 | 28 | Model rewriting made unconditional — the worker echoes its *startup* alias, which need not match its registered alias | `gateway/app/proxy.py` |
 | 29 | Worker registration made retrying — a worker that starts before the gateway must not be lost | `gateway/mock_worker.py` |
 | 30 | Error mapping refined: `404` unknown model, `429` saturated fleet, `502` every worker failed | `gateway/app/main.py` |
+
+### Revision 5 (2026\-10\-22) — Phase 1b
+
+| # | Change | Section |
+|---|---|---|
+| 31 | Redis-backed conversation history with server-authoritative merge rules; the assistant's reply is written back so "continue" mode works | §3\.1, §10 |
+| 32 | Per-client quotas — RPM, TPM and concurrency — with admin-managed API keys; only the SHA-256 hash of a key is stored | §6\.2 |
+| 33 | Real `/v1/completions` text-completion path, replacing the chat alias | §9\.2 |
+| 34 | Grafana dashboard provisioned from `ops/grafana/` — 14 panels over the §5\.1 metric set | §5\.1, §5\.3 |
+| 35 | `max_concurrency = 0` now means unlimited, consistent with the other limits | §6\.2 |
+| 36 | Quota admission reserves an estimated token cost and reconciles it with the real usage on completion | §6\.2 |
+| 37 | Test suite grew from 45 to 81 cases | §8 Phase 1 |
 
 ### Revision 2 (2026\-10\-21)
 

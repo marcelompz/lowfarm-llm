@@ -172,6 +172,43 @@ def create_mock_worker(
             media_type="text/plain; version=0.0.4",
         )
 
+    @app.post("/v1/completions")
+    async def completions(request: Request) -> Any:
+        """Text completion — the real ``/v1/completions``, not a chat alias."""
+        body = await request.json()
+        if fail_mode == "error":
+            return JSONResponse({"error": "mock failure"}, status_code=500)
+
+        prompt = body.get("prompt", "")
+        if isinstance(prompt, list):
+            prompt = prompt[0] if prompt else ""
+        state["requests"] += 1
+
+        if body.get("stream"):
+            return StreamingResponse(
+                _sse_text_body(alias, str(prompt)), media_type="text/event-stream"
+            )
+        return JSONResponse(
+            {
+                "id": f"cmpl-{uuid.uuid4().hex}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": alias,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": f" completion of: {prompt[:40]}",
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 9,
+                    "total_tokens": 17,
+                },
+            }
+        )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
         body = await request.json()
@@ -249,6 +286,33 @@ async def _sse_body(alias: str, body: dict[str, Any]):
         "created": first["created"],
         "model": alias,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield f"data: {json.dumps(final)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def _sse_text_body(alias: str, prompt: str):
+    """Text-completion SSE stream."""
+    delay = 1.0 / max(1.0, TOKENS_PER_SEC)
+    base = {
+        "id": f"cmpl-{uuid.uuid4().hex}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": alias,
+    }
+    words = [w for w in prompt.split() if w][:5] or ["mock", "completion"]
+    for word in words:
+        chunk = {
+            **base,
+            "choices": [
+                {"index": 0, "text": f" {word}", "finish_reason": None, "logprobs": None}
+            ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        await asyncio.sleep(delay)
+    final = {
+        **base,
+        "choices": [{"index": 0, "text": "", "finish_reason": "stop", "logprobs": None}],
     }
     yield f"data: {json.dumps(final)}\n\n"
     yield "data: [DONE]\n\n"

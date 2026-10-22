@@ -85,6 +85,48 @@ class ModelList(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Text completions (the real /v1/completions, not a chat alias)
+# --------------------------------------------------------------------------
+
+
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: str | list[str] = ""
+    stream: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    stop: str | list[str] | None = None
+    seed: int | None = None
+    suffix: str | None = None
+    echo: bool | None = None
+    user: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def conversation_id(self) -> str | None:
+        value = self.metadata.get("conversation_id")
+        return str(value) if value else None
+
+
+class CompletionChoice(BaseModel):
+    index: int = 0
+    text: str = ""
+    finish_reason: str | None = None
+    logprobs: dict[str, Any] | None = None
+
+
+class CompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"cmpl-{uuid.uuid4().hex}")
+    object: Literal["text_completion"] = "text_completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[CompletionChoice]
+    usage: Usage = Field(default_factory=Usage)
+
+
+# --------------------------------------------------------------------------
 # Worker control plane
 # --------------------------------------------------------------------------
 
@@ -148,3 +190,50 @@ class WorkerView(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: dict[str, str]
+
+
+# --------------------------------------------------------------------------
+# Client quotas
+# --------------------------------------------------------------------------
+
+
+class ClientQuota(BaseModel):
+    """Limits applied to one API key.
+
+    A limit of ``0`` means "unlimited" for that dimension.
+    """
+
+    name: str = "client"
+    rpm_limit: int = Field(default=60, ge=0)
+    tpm_limit: int = Field(default=100_000, ge=0)
+    max_concurrency: int = Field(default=8, ge=0)
+    enabled: bool = True
+
+
+class ClientRegistration(ClientQuota):
+    """Payload for creating a client key.  The key itself is returned once."""
+
+    api_key: str | None = None
+
+
+class ClientView(BaseModel):
+    key_hash: str
+    name: str
+    rpm_limit: int
+    tpm_limit: int
+    max_concurrency: int
+    enabled: bool
+    created_at: float
+    requests_current_window: int = 0
+    tokens_current_window: int = 0
+    in_flight: int = 0
+
+class ClientList(BaseModel):
+    clients: list[ClientView]
+
+
+class ChatSessionView(BaseModel):
+    conversation_id: str
+    message_count: int
+    ttl_seconds: int
+    messages: list[dict[str, Any]] = Field(default_factory=list)

@@ -53,6 +53,8 @@ curl -N localhost:8000/v1/chat/completions \
 | `app/registry.py` | Worker membership, telemetry, health state machine |
 | `app/scheduler.py` | Least-outstanding-requests, affinity, admission control |
 | `app/proxy.py` | Upstream forwarding, SSE pass-through, model rewriting |
+| `app/history.py` | Server-side conversation history |
+| `app/quotas.py` | Per-client limits (RPM, TPM, concurrency) |
 | `app/store.py` | Redis backend + in-memory degraded-mode backend |
 | `app/metrics.py` | Prometheus collectors |
 | `app/models.py` | OpenAI-compatible and control-plane schemas |
@@ -65,8 +67,9 @@ curl -N localhost:8000/v1/chat/completions \
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/v1/chat/completions` | Bearer | OpenAI-compatible, SSE or JSON |
-| `POST` | `/v1/completions` | Bearer | OpenAI-compatible |
+| `POST` | `/v1/completions` | Bearer | OpenAI-compatible text completions |
 | `GET` | `/v1/models` | Bearer | Models aggregated from the fleet |
+| `DELETE` | `/v1/chat/conversations/{id}` | Bearer | Clear a stored conversation |
 | `GET` | `/health` | — | Gateway liveness |
 | `GET` | `/ready` | — | Ready = Redis up **and** ≥1 healthy worker |
 | `GET` | `/metrics` | — | Prometheus exposition |
@@ -74,6 +77,10 @@ curl -N localhost:8000/v1/chat/completions \
 | `POST` | `/v1/admin/workers/{id}/heartbeat` | Admin | Telemetry heartbeat |
 | `POST` | `/v1/admin/workers/{id}/drain` | Admin | Remove from rotation |
 | `GET` | `/v1/admin/workers` | Admin | Fleet dump |
+| `POST` | `/v1/admin/clients` | Admin | Create an API key with its own quota |
+| `GET` | `/v1/admin/clients` | Admin | Clients and their live counters |
+| `DELETE` | `/v1/admin/clients/{hash}` | Admin | Revoke a key |
+| `GET` | `/v1/admin/conversations/{id}` | Admin | Inspect a stored conversation |
 
 Error mapping:
 
@@ -82,7 +89,62 @@ Error mapping:
 | Missing/invalid bearer token | `401` |
 | No worker serves the requested model | `404` |
 | Fleet saturated, request queued past the timeout | `429` |
+| Client over its RPM/TPM/concurrency limit | `429` + `Retry-After` |
 | Every worker serving the model failed | `502` |
+
+---
+
+## Conversations
+
+With a `metadata.conversation_id` the gateway keeps the authoritative
+transcript in Redis. Three client shapes are accepted:
+
+| Client sends | Interpretation |
+|---|---|
+| full history + new turn | the client extends the conversation |
+| a truncated history | the server keeps everything it has |
+| a single new user message | "continue the conversation" |
+| anything else that diverges | the client edited or branched — it wins |
+
+The assistant's reply is written back into the history, so a client that
+only sends the new turn still gets the full context on the next request.
+Without a `conversation_id` the gateway is completely stateless.
+
+```sh
+curl -s localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-0.5b-instruct-q4_k_m",
+       "messages":[{"role":"user","content":"hola"}],
+       "metadata":{"conversation_id":"demo-1"}}'
+```
+
+---
+
+## Client quotas
+
+A farm has a finite number of slots, so one noisy client must not be able to
+starve the others. Each API key carries its own limits:
+
+```sh
+curl -s -X POST localhost:8000/v1/admin/clients \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"team-a","rpm_limit":30,"tpm_limit":50000,"max_concurrency":4}'
+```
+
+The response contains the generated key — **it is shown once and never
+stored** (only its SHA-256 hash is kept). A limit of `0` means unlimited.
+
+| Dimension | Enforcement |
+|---|---|
+| RPM | Fixed window. Checked before the request reaches a worker. |
+| TPM | The real token count is only known at the end, so admission reserves an estimate and reconciles it with the actual usage on completion. |
+| Concurrency | Simultaneous in-flight requests per key. |
+
+The fixed window can allow a burst of up to 2× the limit across a window
+boundary — an accepted trade-off, since a sliding window costs a sorted set
+per client.
 
 ---
 
@@ -178,6 +240,14 @@ with defaults. The ones that matter most:
 | `MAX_RETRIES` | `2` | Upstream retries before the first token |
 | `THERMAL_SOFT_LIMIT_C` | `45` | Demotion threshold |
 | `THERMAL_HARD_LIMIT_C` | `52` | Drain threshold |
+| `CHAT_HISTORY_ENABLED` | `true` | Server-side conversation history |
+| `CHAT_HISTORY_MAX_MESSAGES` | `40` | History window (oldest turns dropped) |
+| `CHAT_HISTORY_TTL` | `86400` | History lifetime in Redis (s) |
+| `QUOTAS_ENABLED` | `true` | Per-client limits |
+| `DEFAULT_RPM_LIMIT` | `60` | Requests/min for the bootstrap key |
+| `DEFAULT_TPM_LIMIT` | `100000` | Tokens/min for the bootstrap key |
+| `DEFAULT_MAX_CONCURRENCY` | `8` | In-flight requests for the bootstrap key |
+| `QUOTA_WINDOW_SECONDS` | `60` | Quota window length |
 
 ---
 
@@ -197,7 +267,10 @@ flakiness.
 | `tests/test_security.py` | Auth on both planes, key separation |
 | `tests/test_registry.py` | Membership, telemetry, hysteresis, counters |
 | `tests/test_scheduler.py` | Scoring, affinity, admission control, penalties |
+| `tests/test_history.py` | Merge rules, trimming, isolation, deletion |
+| `tests/test_quotas.py` | RPM/TPM/concurrency limits, reconciliation, lifecycle |
 | `tests/test_api.py` | End-to-end: proxying, SSE, failover, drain, metrics |
+| `tests/test_completions.py` | Text completions, client management, conversations |
 
 ### Observability stack (optional)
 
@@ -206,21 +279,24 @@ docker compose --profile observability up -d
 ```
 
 Prometheus on `:9090`, Grafana on `:3000` (default `admin`/`admin` — change
-`GRAFANA_PASSWORD` in `.env`).
+`GRAFANA_PASSWORD` in `.env`). The dashboard **LowFarm LLM — overview** is
+provisioned automatically: 14 panels covering fleet health, TTFT and latency
+percentiles, per-worker in-flight and slot occupancy, thermal state, battery
+and circuit-breaker state.
 
 ---
 
 ## Known limitations
 
-* **Chat history is not stored server-side.** The client resends the full
-  message list on every turn — which is what makes affinity safe (a
-  reassigned worker is always correct). The plan calls for history in Redis
-  (§3.1); that is not implemented yet, and the client-side contract is the
-  one in force today.
 * **A single gateway is the SPOF.** The design tolerates horizontal
   gateways sharing one Redis (§11 risk 8), but the in-memory hot counters
   (`ewma_latency_ms`, error counts) are per-process today.
-* **`/v1/completions` is aliased to the chat route.** A true text-completion
-  path is not implemented yet.
-* **No per-client quota enforcement.** The schema for it exists in §6.2 of
-  the plan; the middleware does not.
+* **The chat history merge is not fully serialised.** Each request does a
+  read-merge-write under an optimistic transaction; two concurrent requests
+  on the *same* conversation can still interleave.
+* **Streaming responses rarely carry usage.** llama-server only reports
+  token usage in non-streaming mode, so the TPM counter is reconciled from
+  an estimate of the streamed bytes in that case.
+* **Quota windows are fixed, not sliding.** A burst of up to 2× the limit can
+  cross a window boundary.
+* **No rate limiting on the admin plane** beyond the single shared key.

@@ -55,6 +55,21 @@ class Settings(BaseSettings):
     thermal_soft_limit_c: float = Field(default=45.0, ge=0)
     thermal_hard_limit_c: float = Field(default=52.0, ge=0)
 
+    # ---- Chat history (Redis-backed session store) ----------------------
+    chat_history_enabled: bool = True
+    chat_history_max_messages: int = Field(default=40, ge=2)
+    chat_history_ttl: int = Field(default=86400, ge=60)
+
+    # ---- Client quotas --------------------------------------------------
+    quotas_enabled: bool = True
+    default_rpm_limit: int = Field(default=60, ge=0)
+    default_tpm_limit: int = Field(default=100_000, ge=0)
+    default_max_concurrency: int = Field(default=8, ge=1)
+    quota_window_seconds: int = Field(default=60, ge=1)
+    # Rough characters-per-token ratio used to estimate prompt size before
+    # the real usage is known.
+    quota_token_estimate_ratio: int = Field(default=4, ge=1)
+
     # ---- Derived --------------------------------------------------------
 
     @property

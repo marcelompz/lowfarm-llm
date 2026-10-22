@@ -88,8 +88,54 @@ class WorkerProxy:
             data["model"] = requested_model
         return data
 
-    # -- streaming -------------------------------------------------------
+    # -- text completions -------------------------------------------------
 
+    async def complete_text(
+        self, record: WorkerRecord, body: dict[str, Any], requested_model: str
+    ) -> dict[str, Any]:
+        """Forward a text completion to the worker's ``/v1/completions``."""
+        url = f"{record.listen.rstrip('/')}/v1/completions"
+        try:
+            response = await self._client.post(
+                url,
+                json=self._payload(record, body),
+                headers=self._headers(record, stream=False),
+            )
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"worker {record.worker_id} unreachable: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise UpstreamError(
+                f"worker {record.worker_id} returned {response.status_code}: "
+                f"{response.text[:200]}",
+                status_code=502,
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise UpstreamError(f"worker {record.worker_id} returned non-JSON") from exc
+
+        if isinstance(data, dict):
+            data["model"] = requested_model
+        return data
+
+    async def open_text_stream(
+        self, record: WorkerRecord, body: dict[str, Any]
+    ) -> httpx.Response:
+        """Open an upstream text-completion stream (safe to retry)."""
+        url = f"{record.listen.rstrip('/')}/v1/completions"
+        request = self._client.build_request(
+            "POST",
+            url,
+            json=self._payload(record, body),
+            headers=self._headers(record, stream=True),
+        )
+        try:
+            return await self._client.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"worker {record.worker_id} unreachable: {exc}") from exc
+
+    # -- streaming -------------------------------------------------------
     async def open_stream(
         self, record: WorkerRecord, body: dict[str, Any]
     ) -> httpx.Response:
@@ -114,8 +160,14 @@ class WorkerProxy:
         self,
         response: httpx.Response,
         requested_model: str,
+        text_sink: list[str] | None = None,
     ) -> AsyncIterator[bytes]:
-        """Transform the upstream SSE stream into the client-facing stream."""
+        """Transform the upstream SSE stream into the client-facing stream.
+
+        ``text_sink`` receives the generated text as it streams, so the
+        caller can persist the assistant's reply into the conversation
+        history without re-parsing the stream.
+        """
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def pump() -> None:
@@ -146,16 +198,51 @@ class WorkerProxy:
                 buffer += item
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
+                    if text_sink is not None:
+                        _collect_text(line, text_sink)
                     yield _rewrite_model_line(line + b"\n", requested_model)
                 if buffer:
                     # A partial line: hold it until the terminator arrives.
                     pass
             if buffer:
+                if text_sink is not None:
+                    _collect_text(buffer, text_sink)
                 yield _rewrite_model_line(buffer, requested_model)
         finally:
             if not task.done():
                 task.cancel()
             await response.aclose()
+
+
+def _collect_text(line: bytes, sink: list[str]) -> None:
+    """Accumulate the generated text from an SSE data line."""
+    stripped = line.strip()
+    if not stripped.startswith(b"data:"):
+        return
+    raw = stripped[len(b"data:") :].strip()
+    if not raw or raw == b"[DONE]":
+        return
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return
+    first = choices[0]
+    if not isinstance(first, dict):
+        return
+    text = first.get("text")
+    if isinstance(text, str):
+        sink.append(text)
+        return
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str):
+            sink.append(content)
 
 
 def _rewrite_model_line(line: bytes, requested_model: str) -> bytes:

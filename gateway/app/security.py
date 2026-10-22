@@ -1,8 +1,11 @@
 """Bearer-token authentication.
 
-Two independent keys (§6.1):
-  * ``GATEWAY_API_KEY`` protects the public OpenAI-compatible surface.
-  * ``ADMIN_API_KEY``  protects the worker control plane.
+Two planes with two independent keys (§6.1):
+
+  * the **public** plane (``/v1/*``) accepts the bootstrap key plus any
+    per-client key registered through the admin API.  Each client carries
+    its own quota, so the identity is resolved, not just validated;
+  * the **admin** plane (``/v1/admin/*``) uses a single stronger key.
 
 Comparisons are constant time and happen over bytes so non-ASCII keys work.
 """
@@ -11,10 +14,11 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings, get_settings
+from .quotas import ClientIdentity, QuotaManager
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -41,14 +45,17 @@ def _matches(provided: str, expected: str) -> bool:
     return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
-async def require_gateway_key(
+async def require_client(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    settings: Settings = Depends(get_settings),
-) -> str:
+) -> ClientIdentity:
+    """Resolve the caller to a client identity with its own quota."""
     token = _extract(credentials)
-    if not _matches(token, settings.gateway_api_key):
+    manager: QuotaManager = request.app.state.quota_manager
+    identity = await manager.resolve(token)
+    if identity is None:
         raise _unauthorized("Invalid API key")
-    return token
+    return identity
 
 
 async def require_admin_key(

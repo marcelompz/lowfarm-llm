@@ -110,20 +110,21 @@ Full bill of materials with indicative prices: [`docs/MasterProjectPlan.md §9.7
 
 ### Phase 1 — what exists today
 
-The gateway is implemented and running. 45 tests green, verified end-to-end against a live Docker stack.
+The gateway is implemented and running. 81 tests green, verified end-to-end against a live Docker stack.
 
 - ✅ OpenAI-compatible `POST /v1/chat/completions` with SSE streaming and non-streaming JSON
+- ✅ OpenAI-compatible `POST /v1/completions` — real text completions, not a chat alias
 - ✅ Bearer auth on the public plane, a separate admin key on the control plane
 - ✅ Least-outstanding-requests scheduler with power-of-two tie-breaking, thermal penalty, session
   affinity and admission control
 - ✅ Dynamic worker registration + heartbeat, Redis-backed registry with TTL expiry, health state
   machine with hysteresis, per-worker circuit breaker
 - ✅ Failover with a safe retry boundary (retry only before the first token)
+- ✅ Redis-backed conversation history with three client shapes accepted (full, truncated, continue)
+- ✅ Per-client quotas — RPM, TPM and concurrency — with admin-managed API keys
 - ✅ Prometheus metrics for latency, TTFT, in-flight, per-node thermal and battery state
+- ✅ Grafana dashboard provisioned automatically (14 panels) behind the `observability` profile
 - ✅ Mock `llama-server` that self-registers, so the fleet appears with zero gateway configuration
-- ⬜ Redis-backed chat history
-- ⬜ Per-client quotas
-- ⬜ True `/v1/completions` text-completion path
 
 See [`gateway/README.md`](gateway/README.md) for the API surface, the worker protocol and the
 development workflow.
@@ -149,7 +150,7 @@ risk assessment, and configuration templates — lives in
 
 - [ ] Phase 0 — benchmark `Qwen2.5-0.5B` vs `1.5B` (Q4_K_M) on a real A30; freeze the config
 - [x] Phase 1 — gateway with a mock fleet, fault injection and dynamic registration
-- [ ] Phase 1b — Redis-backed chat history, per-client quotas, real text completions
+- [x] Phase 1b — server-side history, per-client quotas, real text completions, Grafana dashboard
 - [ ] Phase 2 — provision and register a first real phone
 - [ ] Phase 3 — scale to a multi-phone fleet with live telemetry
 - [ ] Phase 4 — production deployment with unattended 72 h soak

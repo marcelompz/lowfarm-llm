@@ -8,6 +8,7 @@ Exposes:
   * ``/health`` ``/ready``    liveness and readiness
   * ``/metrics``              Prometheus exposition
   * ``/v1/admin/workers/*``   worker control plane
+  * ``/v1/admin/clients/*``   client and quota management
 """
 
 from __future__ import annotations
@@ -24,9 +25,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 from .config import Settings, get_settings
+from .history import ChatHistory
 from .metrics import Metrics
 from .models import (
     ChatCompletionRequest,
+    ClientRegistration,
+    CompletionRequest,
     Heartbeat,
     ModelCard,
     ModelList,
@@ -34,6 +38,7 @@ from .models import (
     WorkerState,
 )
 from .proxy import UpstreamError, WorkerProxy
+from .quotas import ClientIdentity, QuotaExceeded, QuotaManager
 from .registry import WorkerRecord, WorkerRegistry
 from .scheduler import (
     ModelNotAvailable,
@@ -41,8 +46,8 @@ from .scheduler import (
     NoWorkerAvailable,
     Scheduler,
 )
-from .security import require_admin_key, require_gateway_key
-from .store import MemoryStore, RedisStore, Store
+from .security import require_admin_key, require_client
+from .store import RedisStore, Store
 
 API_VERSION = "v1"
 
@@ -58,7 +63,10 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_store = store or RedisStore(
-            settings.redis_url, settings.worker_stale_ttl, settings.session_ttl
+            settings.redis_url,
+            settings.worker_stale_ttl,
+            settings.session_ttl,
+            chat_ttl=settings.chat_history_ttl,
         )
         registry = WorkerRegistry(
             resolved_store,
@@ -79,6 +87,8 @@ def create_app(
             ),
         )
         proxy = WorkerProxy(http_client, settings)
+        quota_manager = QuotaManager(resolved_store, settings)
+        chat_history = ChatHistory(resolved_store, settings)
 
         app.state.settings = settings
         app.state.store = resolved_store
@@ -87,7 +97,10 @@ def create_app(
         app.state.metrics = metrics
         app.state.proxy = proxy
         app.state.client = http_client
+        app.state.quota_manager = quota_manager
+        app.state.chat_history = chat_history
 
+        await quota_manager.ensure_default_client()
         await _seed_workers(registry, settings)
 
         health_task = asyncio.create_task(_health_loop(app))
@@ -120,24 +133,37 @@ def create_app(
     # Public API
     # ------------------------------------------------------------------
 
-    @app.post("/v1/chat/completions", dependencies=[Depends(require_gateway_key)])
-    async def chat_completions(request: ChatCompletionRequest) -> Response:
-        body = _request_body(request)
-        return await _dispatch(app, request, body)
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        request: ChatCompletionRequest,
+        identity: ClientIdentity = Depends(require_client),
+    ) -> Response:
+        return await _dispatch_chat(app, request, identity)
 
-    @app.post("/v1/completions", dependencies=[Depends(require_gateway_key)])
-    async def completions(request: ChatCompletionRequest) -> Response:
-        body = _request_body(request)
-        return await _dispatch(app, request, body)
+    @app.post("/v1/completions")
+    async def completions(
+        request: CompletionRequest,
+        identity: ClientIdentity = Depends(require_client),
+    ) -> Response:
+        return await _dispatch_text(app, request, identity)
 
-    @app.get("/v1/models", dependencies=[Depends(require_gateway_key)])
-    async def models() -> ModelList:
+    @app.get("/v1/models")
+    async def models(identity: ClientIdentity = Depends(require_client)) -> ModelList:
         workers = await app.state.registry.list_workers()
         seen: dict[str, ModelCard] = {}
         for w in workers:
             if w.state == WorkerState.HEALTHY and w.model and w.model not in seen:
                 seen[w.model] = ModelCard(id=w.model)
         return ModelList(data=list(seen.values()))
+
+    @app.delete("/v1/chat/conversations/{conversation_id}")
+    async def delete_conversation(
+        conversation_id: str,
+        identity: ClientIdentity = Depends(require_client),
+    ) -> dict[str, Any]:
+        history: ChatHistory = app.state.chat_history
+        existed = await history.delete(conversation_id)
+        return {"conversation_id": conversation_id, "deleted": existed}
 
     # ------------------------------------------------------------------
     # Health / observability
@@ -162,9 +188,7 @@ def create_app(
 
     @app.get("/metrics")
     async def prometheus_metrics() -> Response:
-        return Response(
-            content=metrics.render(), media_type=metrics.content_type()
-        )
+        return Response(content=metrics.render(), media_type=metrics.content_type())
 
     # ------------------------------------------------------------------
     # Admin / control plane
@@ -209,6 +233,54 @@ def create_app(
         workers = await app.state.registry.list_workers()
         return {"workers": [w.to_view().model_dump() for w in workers]}
 
+    # -- clients & quotas -------------------------------------------------
+
+    @app.post(
+        "/v1/admin/clients",
+        dependencies=[Depends(require_admin_key)],
+        status_code=201,
+    )
+    async def create_client(payload: ClientRegistration) -> dict[str, Any]:
+        manager: QuotaManager = app.state.quota_manager
+        api_key, key_hash = await manager.create_client(payload, payload.api_key)
+        return {
+            "api_key": api_key,
+            "key_hash": key_hash,
+            "name": payload.name,
+            "rpm_limit": payload.rpm_limit,
+            "tpm_limit": payload.tpm_limit,
+            "max_concurrency": payload.max_concurrency,
+        }
+
+    @app.get("/v1/admin/clients", dependencies=[Depends(require_admin_key)])
+    async def list_clients() -> dict[str, Any]:
+        manager: QuotaManager = app.state.quota_manager
+        clients = await manager.list_clients()
+        return {"clients": [c.model_dump() for c in clients]}
+
+    @app.delete(
+        "/v1/admin/clients/{key_hash}", dependencies=[Depends(require_admin_key)]
+    )
+    async def delete_client(key_hash: str) -> dict[str, Any]:
+        manager: QuotaManager = app.state.quota_manager
+        if not await manager.delete_client(key_hash):
+            raise HTTPException(status_code=404, detail="client not found")
+        return {"key_hash": key_hash, "deleted": True}
+
+    @app.get(
+        "/v1/admin/conversations/{conversation_id}",
+        dependencies=[Depends(require_admin_key)],
+    )
+    async def view_conversation(conversation_id: str) -> dict[str, Any]:
+        history: ChatHistory = app.state.chat_history
+        messages = await history.get(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "message_count": len(messages),
+            "ttl_seconds": settings.chat_history_ttl,
+            "messages": messages,
+        }
+
     @app.get("/")
     async def root() -> dict[str, str]:
         return {
@@ -221,23 +293,35 @@ def create_app(
 
 
 # ----------------------------------------------------------------------
-# Request dispatch
+# Chat completions
 # ----------------------------------------------------------------------
 
 
-def _request_body(request: ChatCompletionRequest) -> dict[str, Any]:
-    body = request.model_dump(exclude_none=True, exclude={"metadata", "extra"})
-    body["messages"] = [m.model_dump(exclude_none=True) for m in request.messages]
-    body.update(request.extra)
-    return body
-
-
-async def _dispatch(app: FastAPI, request: ChatCompletionRequest, body: dict[str, Any]) -> Response:
+async def _dispatch_chat(
+    app: FastAPI,
+    request: ChatCompletionRequest,
+    identity: ClientIdentity,
+) -> Response:
     registry: WorkerRegistry = app.state.registry
     scheduler: Scheduler = app.state.scheduler
     proxy: WorkerProxy = app.state.proxy
     metrics: Metrics = app.state.metrics
     settings: Settings = app.state.settings
+    quota: QuotaManager = app.state.quota_manager
+    history: ChatHistory = app.state.chat_history
+
+    body = _chat_body(request)
+
+    # Server-side history: the client may send a full transcript, a
+    # truncated one, or just the new turn.
+    effective_messages = body["messages"]
+    if request.conversation_id:
+        effective_messages = await history.resolve(
+            request.conversation_id, effective_messages
+        )
+        body["messages"] = effective_messages
+
+    ticket = await _admit(quota, identity, json.dumps(effective_messages))
 
     requested_model = request.model
     conversation_id = request.conversation_id
@@ -253,12 +337,14 @@ async def _dispatch(app: FastAPI, request: ChatCompletionRequest, body: dict[str
                 exclude=failed_workers,
             )
         except ModelNotAvailable as exc:
+            await quota.release(ticket)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except NoEligibleWorker as exc:
-            # Every worker serving this model has already failed.
+            await quota.release(ticket)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except NoWorkerAvailable as exc:
             metrics.queue_depth.set(scheduler.queue_depth)
+            await quota.release(ticket)
             raise HTTPException(status_code=429, detail=str(exc)) from exc
 
         record = selection.record
@@ -271,14 +357,18 @@ async def _dispatch(app: FastAPI, request: ChatCompletionRequest, body: dict[str
         started = time.monotonic()
         try:
             if request.stream:
-                response = await proxy.open_stream(record, body)
+                upstream = await proxy.open_stream(record, body)
                 return _stream_response(
-                    app, record, response, requested_model, started, metrics
+                    app,
+                    record,
+                    upstream,
+                    requested_model,
+                    started,
+                    metrics,
+                    ticket,
+                    conversation_id,
                 )
             data = await proxy.complete(record, body, requested_model)
-            await _finish(registry, metrics, record, started, failed=False)
-            metrics.requests_total.labels(worker=record.worker_id, status="ok").inc()
-            return JSONResponse(data)
         except UpstreamError as exc:
             last_error = exc
             failed_workers.add(record.worker_id)
@@ -289,12 +379,159 @@ async def _dispatch(app: FastAPI, request: ChatCompletionRequest, body: dict[str
             if attempt == attempts - 1:
                 break
             # Nothing was emitted to the client, so retrying is safe (§3.4).
+            continue
+
+        await _finish(registry, metrics, record, started, failed=False)
+        metrics.requests_total.labels(worker=record.worker_id, status="ok").inc()
+        await quota.release(ticket, _usage_tokens(data))
+        await history.record_assistant(conversation_id, _assistant_text(data))
+        return JSONResponse(data)
 
     metrics.requests_total.labels(worker="none", status="error").inc()
+    await quota.release(ticket)
     raise HTTPException(
         status_code=last_error.status_code if last_error else 502,
         detail=str(last_error) if last_error else "no upstream available",
     )
+
+
+# ----------------------------------------------------------------------
+# Text completions
+# ----------------------------------------------------------------------
+
+
+async def _dispatch_text(
+    app: FastAPI,
+    request: CompletionRequest,
+    identity: ClientIdentity,
+) -> Response:
+    registry: WorkerRegistry = app.state.registry
+    scheduler: Scheduler = app.state.scheduler
+    proxy: WorkerProxy = app.state.proxy
+    metrics: Metrics = app.state.metrics
+    settings: Settings = app.state.settings
+    quota: QuotaManager = app.state.quota_manager
+
+    body = _text_body(request)
+    ticket = await _admit(quota, identity, str(request.prompt))
+
+    requested_model = request.model
+    attempts = settings.max_retries + 1
+    last_error: UpstreamError | None = None
+    failed_workers: set[str] = set()
+
+    for attempt in range(attempts):
+        try:
+            selection = await scheduler.select(
+                model=requested_model, exclude=failed_workers
+            )
+        except ModelNotAvailable as exc:
+            await quota.release(ticket)
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except NoEligibleWorker as exc:
+            await quota.release(ticket)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except NoWorkerAvailable as exc:
+            await quota.release(ticket)
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+        record = selection.record
+        await registry.acquire(record.worker_id)
+        metrics.worker_inflight.labels(worker=record.worker_id).set(record.in_flight + 1)
+
+        started = time.monotonic()
+        try:
+            if request.stream:
+                upstream = await proxy.open_text_stream(record, body)
+                return _text_stream_response(
+                    app, record, upstream, requested_model, started, metrics, ticket
+                )
+            data = await proxy.complete_text(record, body, requested_model)
+        except UpstreamError as exc:
+            last_error = exc
+            failed_workers.add(record.worker_id)
+            await _finish(registry, metrics, record, started, failed=True)
+            metrics.requests_total.labels(
+                worker=record.worker_id, status="error"
+            ).inc()
+            if attempt == attempts - 1:
+                break
+            continue
+
+        await _finish(registry, metrics, record, started, failed=False)
+        metrics.requests_total.labels(worker=record.worker_id, status="ok").inc()
+        await quota.release(ticket, _usage_tokens(data))
+        return JSONResponse(data)
+
+    metrics.requests_total.labels(worker="none", status="error").inc()
+    await quota.release(ticket)
+    raise HTTPException(
+        status_code=last_error.status_code if last_error else 502,
+        detail=str(last_error) if last_error else "no upstream available",
+    )
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+
+async def _admit(
+    quota: QuotaManager, identity: ClientIdentity, payload: str
+) -> Any:
+    """Enforce the client's quotas before the request reaches a worker."""
+    estimated = quota.estimate_tokens(payload)
+    try:
+        return await quota.check_and_acquire(identity, estimated)
+    except QuotaExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+
+
+def _chat_body(request: ChatCompletionRequest) -> dict[str, Any]:
+    body = request.model_dump(exclude_none=True, exclude={"metadata", "extra"})
+    body["messages"] = [m.model_dump(exclude_none=True) for m in request.messages]
+    body.update(request.extra)
+    return body
+
+
+def _text_body(request: CompletionRequest) -> dict[str, Any]:
+    body = request.model_dump(exclude_none=True, exclude={"metadata", "extra"})
+    body.update(request.extra)
+    return body
+
+
+def _usage_tokens(data: Any) -> int:
+    if not isinstance(data, dict):
+        return 0
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        try:
+            return int(usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _assistant_text(data: Any) -> str:
+    """Extract the assistant's reply from a chat-completion response."""
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 def _stream_response(
@@ -304,20 +541,27 @@ def _stream_response(
     requested_model: str,
     started: float,
     metrics: Metrics,
+    ticket: Any,
+    conversation_id: str | None = None,
 ) -> StreamingResponse:
     proxy: WorkerProxy = app.state.proxy
     registry: WorkerRegistry = app.state.registry
+    quota: QuotaManager = app.state.quota_manager
+    history: ChatHistory = app.state.chat_history
+    sink: list[str] = []
 
     async def generator() -> AsyncIterator[bytes]:
         first_token = True
         failed = False
+        produced = 0
         try:
-            async for chunk in proxy.iter_sse(upstream, requested_model):
+            async for chunk in proxy.iter_sse(upstream, requested_model, sink):
                 if first_token:
                     first_token = False
                     metrics.ttft.labels(worker=record.worker_id).observe(
                         time.monotonic() - started
                     )
+                produced += len(chunk)
                 yield chunk
         except Exception:
             failed = True
@@ -329,6 +573,51 @@ def _stream_response(
             metrics.requests_total.labels(
                 worker=record.worker_id, status="error" if failed else "ok"
             ).inc()
+            # Streaming responses rarely carry usage; estimate from bytes.
+            await quota.release(ticket, max(0, produced // 4))
+            if not failed:
+                await history.record_assistant(conversation_id, "".join(sink))
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _text_stream_response(
+    app: FastAPI,
+    record: WorkerRecord,
+    upstream: httpx.Response,
+    requested_model: str,
+    started: float,
+    metrics: Metrics,
+    ticket: Any,
+) -> StreamingResponse:
+    proxy: WorkerProxy = app.state.proxy
+    registry: WorkerRegistry = app.state.registry
+    quota: QuotaManager = app.state.quota_manager
+
+    async def generator() -> AsyncIterator[bytes]:
+        failed = False
+        produced = 0
+        try:
+            async for chunk in proxy.iter_sse(upstream, requested_model):
+                produced += len(chunk)
+                yield chunk
+        except Exception:
+            failed = True
+            raise
+        finally:
+            await _finish(registry, metrics, record, started, failed=failed)
+            metrics.requests_total.labels(
+                worker=record.worker_id, status="error" if failed else "ok"
+            ).inc()
+            await quota.release(ticket, max(0, produced // 4))
 
     return StreamingResponse(
         generator(),
@@ -444,7 +733,7 @@ async def _refresh_slots(
         if response.status_code >= 400:
             return
         slots = response.json()
-    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+    except (httpx.HTTPError, ValueError):
         return
     if not isinstance(slots, list):
         return
@@ -456,8 +745,7 @@ async def _seed_workers(registry: WorkerRegistry, settings: Settings) -> None:
     """Bootstrap from WORKER_SEEDS.
 
     Only used when the registry is empty; dynamic registration is the primary
-    path (§3.1).  Seeds are marked as such so they never shadow a real
-    worker's own registration.
+    path (§3.1).
     """
     existing = await registry.list_workers()
     if existing:

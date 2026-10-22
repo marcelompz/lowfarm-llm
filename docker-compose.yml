@@ -27,6 +27,16 @@ services:
       - MAX_RETRIES=${MAX_RETRIES:-2}
       - THERMAL_SOFT_LIMIT_C=${THERMAL_SOFT_LIMIT_C:-45}
       - THERMAL_HARD_LIMIT_C=${THERMAL_HARD_LIMIT_C:-52}
+      # Chat history (Redis-backed session store)
+      - CHAT_HISTORY_ENABLED=${CHAT_HISTORY_ENABLED:-true}
+      - CHAT_HISTORY_MAX_MESSAGES=${CHAT_HISTORY_MAX_MESSAGES:-40}
+      - CHAT_HISTORY_TTL=${CHAT_HISTORY_TTL:-86400}
+      # Client quotas
+      - QUOTAS_ENABLED=${QUOTAS_ENABLED:-true}
+      - DEFAULT_RPM_LIMIT=${DEFAULT_RPM_LIMIT:-60}
+      - DEFAULT_TPM_LIMIT=${DEFAULT_TPM_LIMIT:-100000}
+      - DEFAULT_MAX_CONCURRENCY=${DEFAULT_MAX_CONCURRENCY:-8}
+      - QUOTA_WINDOW_SECONDS=${QUOTA_WINDOW_SECONDS:-60}
     depends_on:
       redis:
         condition: service_healthy
@@ -183,9 +193,12 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      # Dashboards and the Prometheus datasource are provisioned from disk.
       - GF_INSTALL_PLUGINS=
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3000:3000"
     depends_on: [prometheus]
