@@ -103,10 +103,43 @@ Full bill of materials with indicative prices: [`docs/MasterProjectPlan.md §9.7
 | Phase | Scope | Status |
 |---|---|---|
 | **0** | Device benchmark, model & thread/slot decision | ⬜ Planned |
-| **1** | Gateway (FastAPI + Redis), scheduler, worker lifecycle, SSE, mock workers | ⬜ Planned |
+| **1** | Gateway (FastAPI + Redis), scheduler, worker lifecycle, SSE, mock workers | 🟡 In progress |
 | **2** | Phone provisioning, Termux, ARM64 `llama.cpp` build, worker agent | ⬜ Planned |
 | **3** | Fleet integration, dynamic discovery, thermal tuning, degradation tests | ⬜ Planned |
 | **4** | Bare-metal deployment, monitoring, runbook | ⬜ Planned |
+
+### Phase 1 — what exists today
+
+The gateway is implemented and running. 45 tests green, verified end-to-end against a live Docker stack.
+
+- ✅ OpenAI-compatible `POST /v1/chat/completions` with SSE streaming and non-streaming JSON
+- ✅ Bearer auth on the public plane, a separate admin key on the control plane
+- ✅ Least-outstanding-requests scheduler with power-of-two tie-breaking, thermal penalty, session
+  affinity and admission control
+- ✅ Dynamic worker registration + heartbeat, Redis-backed registry with TTL expiry, health state
+  machine with hysteresis, per-worker circuit breaker
+- ✅ Failover with a safe retry boundary (retry only before the first token)
+- ✅ Prometheus metrics for latency, TTFT, in-flight, per-node thermal and battery state
+- ✅ Mock `llama-server` that self-registers, so the fleet appears with zero gateway configuration
+- ⬜ Redis-backed chat history
+- ⬜ Per-client quotas
+- ⬜ True `/v1/completions` text-completion path
+
+See [`gateway/README.md`](gateway/README.md) for the API surface, the worker protocol and the
+development workflow.
+
+### Try it
+
+```sh
+cp .env.example .env && chmod 600 .env   # set the two API keys
+docker compose up -d --build
+
+curl -s localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-0.5b-instruct-q4_k_m",
+       "messages":[{"role":"user","content":"hello farm"}]}'
+```
 
 The full implementation plan — architecture, scheduling policy, failure matrices, metrics catalog,
 risk assessment, and configuration templates — lives in
@@ -115,7 +148,8 @@ risk assessment, and configuration templates — lives in
 ## Roadmap
 
 - [ ] Phase 0 — benchmark `Qwen2.5-0.5B` vs `1.5B` (Q4_K_M) on a real A30; freeze the config
-- [ ] Phase 1 — bring up the gateway with a mock fleet and fault injection
+- [x] Phase 1 — gateway with a mock fleet, fault injection and dynamic registration
+- [ ] Phase 1b — Redis-backed chat history, per-client quotas, real text completions
 - [ ] Phase 2 — provision and register a first real phone
 - [ ] Phase 3 — scale to a multi-phone fleet with live telemetry
 - [ ] Phase 4 — production deployment with unattended 72 h soak
@@ -125,6 +159,7 @@ risk assessment, and configuration templates — lives in
 | Document | Contents |
 |---|---|
 | [`docs/MasterProjectPlan.md`](docs/MasterProjectPlan.md) | The complete technical plan: architecture, scheduling, failure handling, metrics, security, energy strategy, templates, risks |
+| [`gateway/README.md`](gateway/README.md) | Gateway API surface, worker protocol, configuration, development workflow |
 
 ## Contributing
 

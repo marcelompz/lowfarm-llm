@@ -1,0 +1,183 @@
+name: lowfarm
+
+services:
+  gateway:
+    build: ./gateway
+    container_name: lowfarm_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:?set GATEWAY_API_KEY in .env}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      # Bootstrap only; dynamic registration is the primary path (§3.1).
+      - WORKER_SEEDS=${WORKER_SEEDS:-}
+      - SCHEDULING_POLICY=${SCHEDULING_POLICY:-least_outstanding}
+      - DEFAULT_SLOTS_PER_WORKER=${DEFAULT_SLOTS_PER_WORKER:-4}
+      - SESSION_TTL=${SESSION_TTL:-3600}
+      - STREAM_QUEUE_TIMEOUT=${STREAM_QUEUE_TIMEOUT:-120}
+      - HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL:-10}
+      - HEALTH_PROBE_TIMEOUT=${HEALTH_PROBE_TIMEOUT:-3}
+      - HEALTH_FAILURE_THRESHOLD=${HEALTH_FAILURE_THRESHOLD:-3}
+      - HEALTH_RECOVERY_THRESHOLD=${HEALTH_RECOVERY_THRESHOLD:-2}
+      - HALF_OPEN_PROBE_INTERVAL=${HALF_OPEN_PROBE_INTERVAL:-30}
+      - WORKER_STALE_TTL=${WORKER_STALE_TTL:-45}
+      - STREAM_HEARTBEAT_INTERVAL=${STREAM_HEARTBEAT_INTERVAL:-15}
+      - UPSTREAM_REQUEST_TIMEOUT=${UPSTREAM_REQUEST_TIMEOUT:-300}
+      - MAX_RETRIES=${MAX_RETRIES:-2}
+      - THERMAL_SOFT_LIMIT_C=${THERMAL_SOFT_LIMIT_C:-45}
+      - THERMAL_HARD_LIMIT_C=${THERMAL_HARD_LIMIT_C:-52}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+    networks: [lowfarm]
+
+  redis:
+    image: redis:7-alpine
+    container_name: lowfarm_redis
+    # No `ports:` — Redis stays on the internal network only (§6.1).
+    command:
+      - redis-server
+      - --save
+      - "60"
+      - "1"
+      - --maxmemory
+      - "512mb"
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: always
+    networks: [lowfarm]
+
+  # ---------------------------------------------------------------------
+  # Phase 1 development fleet: mock llama-servers.
+  # Replace with real phones once Phase 2 lands.
+  # ---------------------------------------------------------------------
+  mock-1:
+    build: ./gateway
+    container_name: lowfarm_mock_1
+    command:
+      - uvicorn
+      - mock_worker:create_mock_worker
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    environment:
+      - MOCK_ALIAS=mock-1
+      - MOCK_MODEL=qwen2.5-0.5b-instruct-q4_k_m
+      - MOCK_SLOTS=4
+      - MOCK_TOKENS_PER_SEC=24
+      # Dynamic registration (plan 3.1): the worker announces itself.
+      - MOCK_GATEWAY_URL=http://gateway:8000
+      - MOCK_ADMIN_KEY=${ADMIN_API_KEY}
+      - MOCK_WORKER_ID=mock-1
+      - MOCK_LISTEN=http://mock-1:8080
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: always
+    networks: [lowfarm]
+
+  mock-2:
+    build: ./gateway
+    container_name: lowfarm_mock_2
+    command:
+      - uvicorn
+      - mock_worker:create_mock_worker
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    environment:
+      - MOCK_ALIAS=mock-2
+      - MOCK_MODEL=qwen2.5-0.5b-instruct-q4_k_m
+      - MOCK_SLOTS=4
+      - MOCK_TOKENS_PER_SEC=24
+      # Dynamic registration (plan 3.1): the worker announces itself.
+      - MOCK_GATEWAY_URL=http://gateway:8000
+      - MOCK_ADMIN_KEY=${ADMIN_API_KEY}
+      - MOCK_WORKER_ID=mock-2
+      - MOCK_LISTEN=http://mock-2:8080
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: always
+    networks: [lowfarm]
+
+  mock-3:
+    build: ./gateway
+    container_name: lowfarm_mock_3
+    command:
+      - uvicorn
+      - mock_worker:create_mock_worker
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    environment:
+      - MOCK_ALIAS=mock-3
+      - MOCK_MODEL=qwen2.5-0.5b-instruct-q4_k_m
+      - MOCK_SLOTS=4
+      - MOCK_TOKENS_PER_SEC=24
+      # Dynamic registration (plan 3.1): the worker announces itself.
+      - MOCK_GATEWAY_URL=http://gateway:8000
+      - MOCK_ADMIN_KEY=${ADMIN_API_KEY}
+      - MOCK_WORKER_ID=mock-3
+      - MOCK_LISTEN=http://mock-3:8080
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: always
+    networks: [lowfarm]
+
+  # ---------------------------------------------------------------------
+  # Observability (optional): docker compose --profile observability up
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lowfarm_prometheus
+    profiles: [observability]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    networks: [lowfarm]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lowfarm_grafana
+    profiles: [observability]
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [lowfarm]
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  lowfarm:
+    driver: bridge

@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: lowfarm-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]
+        labels:
+          component: gateway
+
+  - job_name: lowfarm-workers
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "mock-1:8080"
+          - "mock-2:8080"
+          - "mock-3:8080"
+        labels:
+          component: worker

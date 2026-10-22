@@ -535,21 +535,27 @@ Run this once per device model **before** rolling out the fleet:
 
 ### Phase 1: Local VM Prototyping (Central Node)
 
-- [ ] Set up local VM with Debian/Ubuntu Server or Fedora Server.  
-- [ ] Install Docker and Docker Compose plugin (verify: `docker --version`, `docker compose version`).  
-- [ ] Implement `LowFarm Gateway` with FastAPI and Redis.  
-  - [ ] OpenAI-compatible surface: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`.  
-  - [ ] SSE pass-through with correct `data: [DONE]` termination and proxy headers.  
-  - [ ] Bearer auth + admin key (§6).  
-  - [ ] `GET /health` and `GET /metrics`.  
-- [ ] Implement the **scheduler** (§4): least-outstanding, power-of-two tie-break, slot accounting, admission control.  
-- [ ] Implement the **worker lifecycle** (§3): `POST /v1/admin/workers/register`, `POST /v1/admin/workers/{id}/heartbeat`, health probes, circuit breaker with hysteresis.  
-- [ ] Implement **session affinity** (§4\.4) in Redis with TTL.  
-- [ ] Create **mock workers** (simulated endpoints using python or local llama.cpp) to test load balancing and failure injection.  
-- [ ] Implement Server-Sent Events (SSE) streaming pass-through.  
-- [ ] Implement Prometheus metrics endpoint (§5\.1) and a Grafana dashboard.  
-- [ ] Write the integration test suite: failover, mid-stream drop, worker reboot, Redis restart, auth rejection.  
-- [ ] **Exit criterion:** a mock fleet of N workers behind the gateway, load-balanced, with fault injection passing.
+*Status: implemented — 45 tests green, verified against a live Docker stack. Items marked ◐ are
+working but incomplete; see the "Known limitations" section of `gateway/README.md`.*
+
+- [x] Set up local VM with Debian/Ubuntu Server or Fedora Server.  
+- [x] Install Docker and Docker Compose plugin (verify: `docker --version`, `docker compose version`).  
+- [x] Implement `LowFarm Gateway` with FastAPI and Redis.  
+  - [x] OpenAI-compatible surface: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`.  
+  - [x] SSE pass-through with correct `data: [DONE]` termination and proxy headers.  
+  - [x] Bearer auth + admin key (§6).  
+  - [x] `GET /health`, `GET /ready` and `GET /metrics`.  
+- [x] Implement the **scheduler** (§4): least-outstanding, power-of-two tie-break, slot accounting, admission control.  
+- [x] Implement the **worker lifecycle** (§3): `POST /v1/admin/workers/register`, `POST /v1/admin/workers/{id}/heartbeat`, health probes, circuit breaker with hysteresis.  
+- [x] Implement **session affinity** (§4\.4) in Redis with TTL.  
+- [x] Create **mock workers** (simulated endpoints using python or local llama.cpp) to test load balancing and failure injection.  
+- [x] Implement Server-Sent Events (SSE) streaming pass-through.  
+- [x] Implement Prometheus metrics endpoint (§5\.1).  
+- [◐] Grafana dashboard — the Prometheus/Grafana services are wired (`ops/prometheus.yml`) but no dashboard JSON is committed yet.  
+- [x] Write the integration test suite: failover, mid-stream drop, worker reboot, Redis restart, auth rejection.  
+- [◐] Redis-backed chat history (§3\.1) — not implemented; the client resends the full history, which keeps affinity safe.  
+- [◐] Per-client quotas (§6\.2) — the data model is specified but the middleware is not written.  
+- [ ] **Exit criterion:** a mock fleet of N workers behind the gateway, load-balanced, with fault injection passing. ◐ *Failover, circuit breaking, TTL eviction and re-registration verified manually against the live stack; the automated suite covers the same paths in-process.*
 
 ### Phase 2: Mobile Worker Provisioning (Samsung A30 & Legacy Devices)
 
@@ -998,6 +1004,17 @@ Point Open WebUI's OpenAI connection at `http://<gateway>:8000/v1` with the bear
 | 22 | New hardware BOM with indicative prices (power meter, current limiters, PSU, fans, UPS, hub, PoE alternative) | §9\.7 |
 | 23 | Five new risks added (node death by cut-off, silent overcharge, thermal dominance, mains loss, limiter under-draw) | §11 |
 | 24 | Scheduled reboot added as the only sanctioned form of node cycling | §7\.5\.1, §9\.3, §8 Phase 2 |
+
+### Revision 4 (2026\-10\-22) — Phase 1 implementation
+
+| # | Change | Section |
+|---|---|---|
+| 25 | Phase 1 implemented: gateway, scheduler, worker lifecycle, SSE, metrics, 45-test suite | §8 Phase 1 |
+| 26 | Gateway code, Docker image, Compose stack and developer documentation added | `gateway/` |
+| 27 | Mock `llama-server` with self-registration, so the fleet appears with zero gateway configuration | `gateway/mock_worker.py` |
+| 28 | Model rewriting made unconditional — the worker echoes its *startup* alias, which need not match its registered alias | `gateway/app/proxy.py` |
+| 29 | Worker registration made retrying — a worker that starts before the gateway must not be lost | `gateway/mock_worker.py` |
+| 30 | Error mapping refined: `404` unknown model, `429` saturated fleet, `502` every worker failed | `gateway/app/main.py` |
 
 ### Revision 2 (2026\-10\-21)
 
